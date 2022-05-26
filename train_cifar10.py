@@ -20,9 +20,10 @@ import torchvision.transforms as transforms
 
 import os
 import argparse
-import pandas as pd
 import csv
 import time
+
+from tqdm import tqdm
 
 from models import *
 from models.vit import ViT
@@ -39,8 +40,8 @@ parser.add_argument('--aug', action='store_true', help='use randomaug')
 parser.add_argument('--amp', action='store_true', help='enable AMP training')
 parser.add_argument('--mixup', action='store_true', help='add mixup augumentations')
 parser.add_argument('--net', default='vit')
-parser.add_argument('--bs', default='256')
-parser.add_argument('--size', default="32")
+parser.add_argument('--bs', default='16')
+parser.add_argument('--size', default="224")
 parser.add_argument('--n_epochs', type=int, default='50')
 parser.add_argument('--patch', default='4', type=int)
 parser.add_argument('--dimhead', default="512", type=int)
@@ -49,15 +50,6 @@ parser.add_argument('--cos', action='store_false', help='Train with cosine annea
 
 args = parser.parse_args()
 
-# take in args
-import wandb
-watermark = "{}_lr{}".format(args.net, args.lr)
-if args.amp:
-    watermark += "_useamp"
-
-wandb.init(project="cifar10-challange",
-           name=watermark)
-wandb.config.update(args)
 
 if args.aug:
     import albumentations
@@ -95,11 +87,11 @@ if args.aug:
     N = 2; M = 14;
     transform_train.transforms.insert(0, RandAugment(N, M))
 
-trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_train)
-trainloader = torch.utils.data.DataLoader(trainset, batch_size=bs, shuffle=True, num_workers=8)
+trainset = torchvision.datasets.CIFAR10(root='../dataset', train=True, download=True, transform=transform_train)
+trainloader = torch.utils.data.DataLoader(trainset, batch_size=bs, shuffle=True, num_workers=0)
 
-testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_test)
-testloader = torch.utils.data.DataLoader(testset, batch_size=100, shuffle=False, num_workers=8)
+testset = torchvision.datasets.CIFAR10(root='../dataset', train=False, download=True, transform=transform_test)
+testloader = torch.utils.data.DataLoader(testset, batch_size=100, shuffle=False, num_workers=0)
 
 classes = ('plane', 'car', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
 
@@ -145,18 +137,8 @@ elif args.net=="simplevit":
 )
 
 elif args.net=="vit":
-    # ViT for cifar10
-    net = ViT(
-    image_size = size,
-    patch_size = args.patch,
-    num_classes = 10,
-    dim = int(args.dimhead),
-    depth = 6,
-    heads = 8,
-    mlp_dim = 512,
-    dropout = 0.1,
-    emb_dropout = 0.1
-)
+    from pytorch_pretrained_vit import ViT
+    net = ViT('B_16_imagenet1k', pretrained=True, num_classes=10, patches=12, image_size=224)
 elif args.net=="vit_timm":
     import timm
     net = timm.create_model("vit_base_patch16_384", pretrained=True)
@@ -225,10 +207,6 @@ if not args.cos:
 else:
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.n_epochs)
 
-if args.cos:
-    wandb.config.scheduler = "cosine"
-else:
-    wandb.config.scheduler = "ReduceLROnPlateau"
 
 ##### Training
 scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
@@ -238,7 +216,7 @@ def train(epoch):
     train_loss = 0
     correct = 0
     total = 0
-    for batch_idx, (inputs, targets) in enumerate(trainloader):
+    for batch_idx, (inputs, targets) in enumerate(tqdm(trainloader)):
         inputs, targets = inputs.to(device), targets.to(device)
         # Train with amp
         with torch.cuda.amp.autocast(enabled=use_amp):
@@ -266,7 +244,7 @@ def test(epoch):
     correct = 0
     total = 0
     with torch.no_grad():
-        for batch_idx, (inputs, targets) in enumerate(testloader):
+        for batch_idx, (inputs, targets) in enumerate(tqdm(testloader)):
             inputs, targets = inputs.to(device), targets.to(device)
             outputs = net(inputs)
             loss = criterion(outputs, targets)
@@ -281,7 +259,7 @@ def test(epoch):
     
     # Update scheduler
     if not args.cos:
-        scheduler.step(test_loss)
+        scheduler.step()
     
     # Save checkpoint.
     acc = 100.*correct/total
@@ -305,7 +283,6 @@ def test(epoch):
 list_loss = []
 list_acc = []
 
-wandb.watch(net)
 for epoch in range(start_epoch, args.n_epochs):
     start = time.time()
     trainloss = train(epoch)
@@ -316,10 +293,7 @@ for epoch in range(start_epoch, args.n_epochs):
     
     list_loss.append(val_loss)
     list_acc.append(acc)
-    
-    # Log training..
-    wandb.log({'epoch': epoch, 'train_loss': trainloss, 'val_loss': val_loss, "val_acc": acc, "lr": optimizer.param_groups[0]["lr"],
-        "epoch_time": time.time()-start})
+
 
     # Write out csv..
     with open(f'log/log_{args.net}_patch{args.patch}.csv', 'w') as f:
@@ -328,6 +302,4 @@ for epoch in range(start_epoch, args.n_epochs):
         writer.writerow(list_acc) 
     print(list_loss)
 
-# writeout wandb
-wandb.save("wandb_{}.h5".format(args.net))
     
